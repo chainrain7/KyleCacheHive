@@ -1,0 +1,15 @@
+# 构建目录与产物
+build/
+build-debug/
+cmake-build-debug/
+.idea/
+bin/
+lib/
+
+# 运行时生成：节点配置与持久化文件
+test.conf
+persist*.txt
+
+*.out
+*.a
+*.tmp
