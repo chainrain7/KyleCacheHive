@@ -6,6 +6,7 @@
 #include <fstream>
 #include <string>
 #include "rpcheader.pb.h"
+#include "rpcframe.h"
 #include "util.h"
 /*
 service_name =>  service描述
@@ -131,9 +132,32 @@ std::string   insert和copy方法
 // 这里来的肯定是一个远程调用请求
 // 因此本函数需要：解析请求，根据服务名，方法名，参数，来调用service的来callmethod来调用本地的业务
 void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::net::Buffer *buffer, muduo::Timestamp) {
-  // 网络上接收的远程rpc调用请求的字符流    Login args
-  std::string recv_buf = buffer->retrieveAllAsString();
+  // 协议分帧：[4 字节大端长度][payload]。一帧可能分多次到达（超过单个 TCP 段的大请求），
+  // 必须等整帧到齐再解析，并循环处理缓冲区里所有完整的帧。
+  // 原实现一次取走全部字节直接解析：半包时请求被丢弃，约 64KB 以上的快照请求无法成功传输
+  while (true) {
+    if (buffer->readableBytes() < 4) {
+      return;  // 连长度头都没到齐，等下一次可读事件
+    }
+    const uint32_t frameLen = rpcframe::DecodeLength(buffer->peek());
+    if (frameLen > rpcframe::kMaxFrameLength) {
+      std::cout << "rpc frame length " << frameLen << " exceeds limit, close connection" << std::endl;
+      conn->forceClose();
+      return;
+    }
+    if (buffer->readableBytes() < 4 + frameLen) {
+      return;  // 帧未到齐：不消费缓冲区，等剩余数据到达
+    }
+    buffer->retrieve(4);
+    if (!HandleFrame(conn, buffer->retrieveAsString(frameLen))) {
+      conn->forceClose();  // 帧内容损坏，连接已不可信
+      return;
+    }
+  }
+}
 
+// 解析并分发一帧完整的请求：payload = varint(rpcHeader 长度) + RpcHeader + args
+bool RpcProvider::HandleFrame(const muduo::net::TcpConnectionPtr &conn, const std::string &recv_buf) {
   // 使用protobuf的CodedInputStream来解析数据流
   google::protobuf::io::ArrayInputStream array_input(recv_buf.data(), recv_buf.size());
   google::protobuf::io::CodedInputStream coded_input(&array_input);
@@ -160,8 +184,8 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::net
     args_size = rpcHeader.args_size();
   } else {
     // 数据头反序列化失败
-    std::cout << "rpc_header_str:" << rpc_header_str << " parse error!" << std::endl;
-    return;
+    std::cout << "rpc header parse error!" << std::endl;
+    return false;
   }
 
   // 获取rpc方法参数的字符流数据
@@ -171,7 +195,7 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::net
 
   if (!read_args_success) {
     // 处理错误：参数数据读取失败
-    return;
+    return false;
   }
 
   // 打印调试信息
@@ -192,31 +216,35 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::net
       std::cout << item.first << " ";
     }
     std::cout << std::endl;
-    return;
+    return true;  // 应用层错误（未知服务）：帧已完整消费，连接仍然可用，只是不回响应
   }
 
   auto mit = it->second.m_methodMap.find(method_name);
   if (mit == it->second.m_methodMap.end()) {
     std::cout << service_name << ":" << method_name << " is not exist!" << std::endl;
-    return;
+    return true;
   }
 
   google::protobuf::Service *service = it->second.m_service;       // 获取service对象  new UserService
   const google::protobuf::MethodDescriptor *method = mit->second;  // 获取method对象  Login
 
   // 生成rpc方法调用的请求request和响应response参数,由于是rpc的请求，因此请求需要通过request来序列化
-  google::protobuf::Message *request = service->GetRequestPrototype(method).New();
+  // 请求/响应消息都必须释放：原实现 New() 之后从不 delete，每个 RPC 都泄漏两个消息对象
+  //（闭包不需要管：NewCallback 创建的闭包 Run() 之后自行销毁）
+  std::unique_ptr<google::protobuf::Message> request(service->GetRequestPrototype(method).New());
   if (!request->ParseFromString(args_str)) {
-    std::cout << "request parse error, content:" << args_str << std::endl;
-    return;
+    std::cout << "request parse error" << std::endl;
+    return true;
   }
-  google::protobuf::Message *response = service->GetResponsePrototype(method).New();
+  std::shared_ptr<google::protobuf::Message> response(service->GetResponsePrototype(method).New());
 
   // 给下面的method方法的调用，绑定一个Closure的回调函数
   // closure是执行完本地方法之后会发生的回调，因此需要完成序列化和反向发送请求的操作
+  //（闭包持有一份 response 的 shared_ptr，响应发送完之前对象一定存活）
   google::protobuf::Closure *done =
-      google::protobuf::NewCallback<RpcProvider, const muduo::net::TcpConnectionPtr &, google::protobuf::Message *>(
-          this, &RpcProvider::SendRpcResponse, conn, response);
+      google::protobuf::NewCallback<RpcProvider, const muduo::net::TcpConnectionPtr &,
+                                    std::shared_ptr<google::protobuf::Message>>(this, &RpcProvider::SendRpcResponse, conn,
+                                                                                response);
 
   // 在框架上根据远端rpc请求，调用当前rpc节点上发布的方法
   // new UserService().Login(controller, request, response, done)
@@ -230,17 +258,21 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::net
   由于xx方法被 用户注册的service类 重写了，因此这个方法运行的时候会调用 用户注册的service类 的xx方法
   真的是妙呀
   */
-  //真正调用方法
-  service->CallMethod(method, nullptr, request, response, done);
+  //真正调用方法。注意不能 delete done：protobuf 的 NewCallback 创建的闭包在 Run() 之后会自行销毁
+  //（本项目的 handler 都是同步实现，返回前已经调用过 done->Run()）
+  service->CallMethod(method, nullptr, request.get(), response.get(), done);
+  return true;
 }
 
 // Closure的回调操作，用于序列化rpc的响应和网络发送,发送响应回去
-void RpcProvider::SendRpcResponse(const muduo::net::TcpConnectionPtr &conn, google::protobuf::Message *response) {
+void RpcProvider::SendRpcResponse(const muduo::net::TcpConnectionPtr &conn,
+                                  std::shared_ptr<google::protobuf::Message> response) {
   std::string response_str;
   if (response->SerializeToString(&response_str))  // response进行序列化
   {
-    // 序列化成功后，通过网络把rpc方法执行的结果发送会rpc的调用方
-    conn->send(response_str);
+    // 序列化成功后，通过网络把rpc方法执行的结果发送会rpc的调用方。
+    // 响应同样带长度前缀：否则字段全是默认值的空响应是 0 字节，客户端什么都收不到
+    conn->send(rpcframe::Encode(response_str));
   } else {
     std::cout << "serialize response_str error!" << std::endl;
   }

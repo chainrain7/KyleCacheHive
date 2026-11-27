@@ -217,7 +217,7 @@ void Raft::startElectionRound(bool isPreVote) {
 
     std::shared_ptr<raftRpcProctoc::RequestVoteArgs> requestVoteArgs =
         std::make_shared<raftRpcProctoc::RequestVoteArgs>();
-    requestVoteArgs->set_term(m_currentTerm);  // 预投票用当前 term（不膨胀）
+    requestVoteArgs->set_term(isPreVote ? m_currentTerm + 1 : m_currentTerm);  // 预投票用下一个任期试探（自己不增 term）
     requestVoteArgs->set_candidateid(m_me);
     requestVoteArgs->set_lastlogindex(lastLogIndex);
     requestVoteArgs->set_lastlogterm(lastLogTerm);
@@ -245,12 +245,7 @@ void Raft::doHeartBeat() {
       }
       DPrintf("[func-Raft::doHeartBeat()-Leader: {%d}] Leader的心跳定时器触发了 index:{%d}\n", m_me, i);
       myAssert(m_nextIndex[i] >= 1, format("rf.nextIndex[%d] = {%d}", i, m_nextIndex[i]));
-      //日志压缩加入后要判断是发送快照还是发送AE
-      if (m_nextIndex[i] <= m_lastSnapshotIncludeIndex) {
-        std::thread t(&Raft::leaderSendSnapShot, this, i);  // 创建新线程并执行b函数，并传递参数
-        t.detach();
-        continue;
-      }
+      //日志落后于快照边界的 peer 由 replicateToPeer 内部改发快照；
       //在途时只记 pending（由 finishInflight 补发），不叠加发送
       replicateToPeer(i);
     }
@@ -389,6 +384,9 @@ void Raft::InstallSnapshot(const raftRpcProctoc::InstallSnapshotRequest* args,
   }
   m_status = Follower;
   m_lastResetElectionTime = now();
+  // 任何返回路径都必须填 term：字段全是默认值的响应序列化后是 0 字节，没有分帧时客户端什么都收不到，
+  // 只能等到超时。leader 重发快照时会因此误判为失败，永远不给该节点发送快照之后的日志
+  reply->set_term(m_currentTerm);
   // outdated snapshot
   if (args->lastsnapshotincludeindex() <= m_lastSnapshotIncludeIndex) {
     //        DPrintf("[func-InstallSnapshot-rf{%v}] leader{%v}.LastSnapShotIncludeIndex{%v} <=
@@ -425,6 +423,8 @@ void Raft::InstallSnapshot(const raftRpcProctoc::InstallSnapshotRequest* args,
   //    DPrintf("[func-InstallSnapshot-rf{%v}] receive snapshot from {%v} ,LastSnapShotIncludeIndex ={%v} ", rf.me,
   //    args.LeaderId, args.LastSnapShotIncludeIndex)
   //持久化
+  DPrintf("[func-InstallSnapshot-rf{%d}] 收到 leader{%d} 的快照 lastsnapshotincludeindex{%d} term{%d}", m_me,
+          args->leaderid(), args->lastsnapshotincludeindex(), args->term());
   m_persister->Save(persistData(), args->data());
 }
 
@@ -481,22 +481,33 @@ void Raft::leaderHearBeatTicker() {
   }
 }
 
+// 向落后于快照边界的 follower 发送快照。自带在途保护：同一 peer 同时至多一个快照 RPC 在途，
+// 因此可以从任意路径（心跳 / AE 被拒后立即触发）调用，不会堆积线程。
 void Raft::leaderSendSnapShot(int server) {
-  m_mtx.lock();
+  std::unique_lock<std::mutex> lk(m_mtx);
+  if (m_status != Leader || m_snapshotInflight[server]) {
+    return;
+  }
+  m_snapshotInflight[server] = true;
+  // 任意返回路径都清在途标志（DEFER 在 lk 之后声明，析构时仍持锁）
+  DEFER { m_snapshotInflight[server] = false; };
+
   raftRpcProctoc::InstallSnapshotRequest args;
   args.set_leaderid(m_me);
   args.set_term(m_currentTerm);
   args.set_lastsnapshotincludeindex(m_lastSnapshotIncludeIndex);
   args.set_lastsnapshotincludeterm(m_lastSnapshotIncludeTerm);
   args.set_data(m_persister->ReadSnapshot());
+  DPrintf("[func-leaderSendSnapShot-rf{%d}] 向节点{%d}发送快照 lastsnapshotincludeindex{%d} term{%d}", m_me, server,
+          args.lastsnapshotincludeindex(), args.term());
 
   raftRpcProctoc::InstallSnapshotResponse reply;
-  m_mtx.unlock();
+  lk.unlock();  // RPC 期间不持锁
   bool ok = m_peers[server]->InstallSnapshot(&args, &reply);
-  m_mtx.lock();
-  DEFER { m_mtx.unlock(); };
+  lk.lock();
   if (!ok) {
-    return;
+    DPrintf("[func-leaderSendSnapShot-rf{%d}] 向节点{%d}的快照 RPC 失败", m_me, server);
+    return;  // 失败/超时：等下一次心跳重试
   }
   if (m_status != Leader || m_currentTerm != args.term()) {
     return;  //中间释放过锁，可能状态已经改变了
@@ -513,6 +524,11 @@ void Raft::leaderSendSnapShot(int server) {
   }
   m_matchIndex[server] = args.lastsnapshotincludeindex();
   m_nextIndex[server] = m_matchIndex[server] + 1;
+  DPrintf("[func-leaderSendSnapShot-rf{%d}] 节点{%d}快照安装成功 matchIndex{%d} nextIndex{%d} lastLogIndex{%d}", m_me,
+          server, m_matchIndex[server], m_nextIndex[server], getLastLogIndex());
+  leaderUpdateCommitIndex();  // matchIndex 变了，重新计算提交点
+  // 快照装完后立即接着复制快照之后的日志，不等下一个心跳
+  replicateToPeer(server);
 }
 
 void Raft::leaderUpdateCommitIndex() {
@@ -545,7 +561,10 @@ void Raft::replicateToPeer(int server) {
     return;
   }
   if (m_nextIndex[server] <= m_lastSnapshotIncludeIndex) {
-    // 落后到快照边界内，交给心跳的快照分支（leaderSendSnapShot）同步
+    // 该 peer 的日志落后于快照边界：发快照而不是 AE。leaderSendSnapShot 自带在途保护
+    //（同一 peer 同时至多一个快照 RPC），这里直接触发，不必等下一个心跳
+    std::thread t(&Raft::leaderSendSnapShot, this, server);
+    t.detach();
     return;
   }
   if (m_aeInflight[server]) {
@@ -640,7 +659,8 @@ void Raft::RequestVote(const raftRpcProctoc::RequestVoteArgs* args, raftRpcProct
   if (args->isprevote()) {
     // 预投票（PreVote）：只表达"如果你的日志够新、这个 term 我愿意投你"的意见，
     // 不更新本地 term/votedFor、不落盘、不重置选举定时器（避免预投票抑制别人的正常选举）
-    if (args->term() < m_currentTerm) {
+    // 候选人发来的是它的下一个任期；不高于我的当前任期，说明它并不比我新，拒绝（回复我的任期让它跟上）
+    if (args->term() <= m_currentTerm) {
       reply->set_term(m_currentTerm);
       reply->set_votestate(Expire);
       reply->set_votegranted(false);
@@ -652,12 +672,16 @@ void Raft::RequestVote(const raftRpcProctoc::RequestVoteArgs* args, raftRpcProct
       reply->set_votegranted(false);
       return;
     }
-    if (m_votedFor != -1 && m_votedFor != args->candidateid()) {
+    // 同一个预期任期内只预投给一个人。注意不能拿 m_votedFor 来判断：它记录的是当前任期的正式投票，
+    // 稳定集群里每个 follower 都已经投给现任 leader，用它判断会让 leader 宕机后永远选不出新 leader
+    if (m_preVoteTerm == args->term() && m_preVotedFor != -1 && m_preVotedFor != args->candidateid()) {
       reply->set_term(m_currentTerm);
       reply->set_votestate(Voted);
       reply->set_votegranted(false);
       return;
     }
+    m_preVoteTerm = args->term();
+    m_preVotedFor = args->candidateid();
     reply->set_term(m_currentTerm);
     reply->set_votestate(Normal);
     reply->set_votegranted(true);
@@ -859,10 +883,13 @@ bool Raft::sendRequestVote(int server, std::shared_ptr<raftRpcProctoc::RequestVo
                format("[func-sendRequestVote-rf{%d}]  term:{%d} 同一个term当两次领导，error", m_me, m_currentTerm));
     }
     if (args->isprevote()) {
-      // 预投票拿到多数派：现在才真正开始选举（term+1、投自己、落盘、重发正式投票）
-      DPrintf("[func-sendRequestVote rf{%d}] pre-vote majority granted, start real election, term will bump from %d",
-              m_me, m_currentTerm);
-      startElectionRound(false);
+      // 预投票拿到多数派，且本轮预投票仍然有效（期间没有因为收到 leader 心跳/更高任期而作废），
+      // 才真正开始选举（term+1、投自己、落盘、重发正式投票）
+      if (m_status == Candidate && args->term() == m_currentTerm + 1) {
+        DPrintf("[func-sendRequestVote rf{%d}] pre-vote majority granted, start real election, term will bump from %d",
+                m_me, m_currentTerm);
+        startElectionRound(false);
+      }
       return true;
     }
     //	第一次变成leader，初始化状态和nextIndex、matchIndex
@@ -950,13 +977,13 @@ bool Raft::sendAppendEntries(int server, int epoch, std::shared_ptr<raftRpcProct
     if (reply->updatenextindex() != -100) {
       DPrintf("[func -sendAppendEntries  rf{%d}]  返回的日志term相等，但是不匹配，回缩nextIndex[%d]：{%d}\n", m_me,
               server, reply->updatenextindex());
-      // 只回缩不前进：迟到的旧 reply 不能把 nextIndex 拉回（原来直接赋值有此隐患），
-      // 且不允许回缩进快照边界内（那该走快照同步）
-      m_nextIndex[server] =
-          std::max(m_lastSnapshotIncludeIndex + 1,
-                   std::min(m_nextIndex[server], reply->updatenextindex()));  //失败是不更新mathIndex的
+      // 只回缩不前进：迟到的旧 reply 不能把 nextIndex 拉回（原来直接赋值有此隐患）。
+      // 这里不能加不低于快照点+1 的下限：follower 的日志落后于快照点时，nextIndex 必须能落到
+      // 快照点及以下，replicateToPeer 才会改发快照。之前加了下限，快照同步永远触发不了，
+      // 掉队的节点永远追不上（且 leader 对着它无限重发 AE）
+      m_nextIndex[server] = std::min(m_nextIndex[server], reply->updatenextindex());  //失败时不更新matchIndex
     }
-    //回缩后重试（pipeline：立即补发，不等下个心跳）
+    //回缩后重试（pipeline：立即补发，不等下个心跳）；若已回缩到快照点内，replicateToPeer 会改发快照
     m_aePending[server] = true;
   } else {
     // rf.matchIndex[server] = len(args.Entries) //只要返回一个响应就对其matchIndex应该对其做出反应，
@@ -1166,6 +1193,7 @@ void Raft::init(std::vector<std::shared_ptr<RaftRpcUtil>> peers, int me, std::sh
     m_aeInflight.push_back(false);
     m_aePending.push_back(false);
     m_aeEpoch.push_back(0);
+    m_snapshotInflight.push_back(false);
   }
   m_votedFor = -1;
 

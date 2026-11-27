@@ -8,10 +8,35 @@
 #include "config.h"
 #include "mprpccontroller.h"
 #include "rpcheader.pb.h"
+#include "rpcframe.h"
 #include "util.h"
 
+namespace {
+
+// 从 fd 上恰好读满 n 字节（循环处理短读）。fd 已设置 SO_RCVTIMEO：超时、出错、对端关闭都返回 false
+bool RecvAll(int fd, char *buf, size_t n) {
+  size_t got = 0;
+  while (got < n) {
+    ssize_t r = recv(fd, buf + got, n - got, 0);
+    if (r < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (r == 0) {
+      return false;  // 对端关闭连接
+    }
+    got += static_cast<size_t>(r);
+  }
+  return true;
+}
+
+}  // namespace
+
 /*
-header_size + service_name method_name args_size + args
+线上格式（请求、响应两个方向相同）：[4 字节大端长度][payload]
+请求 payload：header_size + service_name method_name args_size + args
 */
 // 所有通过stub代理对象调用的rpc方法，都会走到这里了，
 // 统一通过rpcChannel来调用方法
@@ -72,8 +97,9 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
     coded_output.WriteString(rpc_header_str);
   }
 
-  // 最后，将请求参数附加到send_rpc_str后面
+  // 最后，将请求参数附加到send_rpc_str后面，并加上 4 字节长度前缀组成一帧
   send_rpc_str += args_str;
+  send_rpc_str = rpcframe::Encode(send_rpc_str);
 
   // 打印调试信息
   //    std::cout << "============================================" << std::endl;
@@ -111,31 +137,42 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
 从时间节点来说，这里将请求发送过去之后rpc服务的提供者就会开始处理，返回的时候就代表着已经返回响应了
 */
 
-  // 接收rpc请求的响应值（fd 已设置 SO_RCVTIMEO，对端卡死/被 STOP 时不会无限阻塞）
-  char recv_buf[4096] = {0};
-  int recv_size = 0;
-  if (-1 == (recv_size = recv(m_clientFd, recv_buf, sizeof(recv_buf), 0))) {
-    bool isTimeout = (errno == EAGAIN || errno == EWOULDBLOCK);
+  // 接收响应：[4 字节长度][response]，按长度把整帧读满。
+  // 原实现只 recv 一次、缓冲区 4096 字节：响应超过 4KB 或分多个 TCP 段到达时解析失败，
+  // 空响应则一个字节都收不到（只能等超时）。fd 已设置 SO_RCVTIMEO，对端卡死时不会无限阻塞
+  auto failRecv = [this, controller](const char *stage) {
+    const int err = errno;
     close(m_clientFd);  // 超时/错误后连接状态不可信（半截响应可能还在路上），强制重连
     m_clientFd = -1;
     char errtxt[512] = {0};
-    sprintf(errtxt, "recv %s! errno:%d", isTimeout ? "timeout" : "error", errno);
+    sprintf(errtxt, "recv %s! stage:%s errno:%d", (err == EAGAIN || err == EWOULDBLOCK) ? "timeout" : "error", stage,
+            err);
     controller->SetFailed(errtxt);
+  };
+
+  char lenBuf[4] = {0};
+  if (!RecvAll(m_clientFd, lenBuf, sizeof(lenBuf))) {
+    failRecv("frame header");
     return;
   }
-  if (recv_size == 0) {
-    // 对端正常关闭连接
+  const uint32_t frameLen = rpcframe::DecodeLength(lenBuf);
+  if (frameLen > rpcframe::kMaxFrameLength) {
     close(m_clientFd);
     m_clientFd = -1;
-    controller->SetFailed("recv error! peer closed connection");
+    controller->SetFailed("recv error! invalid frame length");
+    return;
+  }
+  std::string recv_buf(frameLen, '\0');
+  if (frameLen > 0 && !RecvAll(m_clientFd, &recv_buf[0], frameLen)) {
+    failRecv("frame body");
     return;
   }
 
-  // 反序列化rpc调用的响应数据
-  if (!response->ParseFromArray(recv_buf, recv_size)) {
-    char errtxt[1050] = {0};
-    sprintf(errtxt, "parse error! response_str:%s", recv_buf);
-    controller->SetFailed(errtxt);
+  // 反序列化rpc调用的响应数据（失败说明帧内容损坏，连接已不可信）
+  if (!response->ParseFromString(recv_buf)) {
+    close(m_clientFd);
+    m_clientFd = -1;
+    controller->SetFailed("parse error! invalid response frame");
     return;
   }
 }

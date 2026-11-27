@@ -23,3 +23,10 @@ target_link_libraries(benchMain skip_list_on_raft protobuf boost_serialization)
 set(SRC_LIST4 kvRecoverTest.cpp)
 add_executable(kvRecoverTest ${src_raftClerk} ${SRC_LIST4} ${src_common})
 target_link_libraries(kvRecoverTest skip_list_on_raft protobuf boost_serialization)
+
+#################################
+
+# 大值回归：验证 RPC 分帧（超过单个 TCP 段与旧 4KB 接收缓冲区的值能写入并读回）
+set(SRC_LIST5 kvBigValueTest.cpp)
+add_executable(kvBigValueTest ${src_raftClerk} ${SRC_LIST5} ${src_common})
+target_link_libraries(kvBigValueTest skip_list_on_raft protobuf boost_serialization)

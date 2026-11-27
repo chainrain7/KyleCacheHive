@@ -41,6 +41,10 @@ class Raft : public raftRpcProctoc::raftRpc {
   int m_me;
   int m_currentTerm;
   int m_votedFor;
+  // 预投票记录（易失，不落盘）：在预期任期 m_preVoteTerm 内预投给了 m_preVotedFor。
+  // 必须与 m_votedFor 分开：后者是当前任期的正式投票，稳定集群里所有节点都已投给现任 leader
+  int m_preVoteTerm = 0;
+  int m_preVotedFor = -1;
   std::vector<raftRpcProctoc::LogEntry> m_logs;  //// 日志条目数组，包含了状态机要执行的指令集，以及收到领导时的任期号
                                                  // 这两个状态所有结点都在维护，易失
   int m_commitIndex;
@@ -57,6 +61,9 @@ class Raft : public raftRpcProctoc::raftRpc {
   // AE 轮次号：新任期开始时自增，旧任期的在途 AE 返回后凭 epoch 失效，
   // 防止误清/误触发新任期的在途状态
   std::vector<int> m_aeEpoch;
+  // 快照 RPC 在途标志：同一 peer 同时至多一个 InstallSnapshot 在途（对落后/不可达的 peer
+  // 不再随心跳堆积线程）。当选时不重置——旧任期的在途 RPC 返回时会自行清掉
+  std::vector<bool> m_snapshotInflight;
   enum Status { Follower, Candidate, Leader };
   // 身份
   Status m_status;
@@ -104,7 +111,7 @@ class Raft : public raftRpcProctoc::raftRpc {
    * 触发点：Start() 新日志提交后 / AE ack 后链式续发 / 心跳 tick 兜底。
    * 在途管理：该 peer 上一轮 AE 未返回时只置 m_aePending，由 finishInflight 补发，
    * 保证任意时刻每个 peer 至多一个在途 AE（不随提交速率堆积线程）。
-   * 落后到快照边界内的 peer 交由心跳的快照分支（leaderSendSnapShot）处理。
+   * nextIndex 已回缩到快照点及以下的 peer 改发快照（leaderSendSnapShot，自带在途保护）。
    */
   void replicateToPeer(int server);
 
